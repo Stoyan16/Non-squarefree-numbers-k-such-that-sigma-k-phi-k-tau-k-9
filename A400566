@@ -1,0 +1,735 @@
+import math
+import itertools
+import bisect
+import time
+
+# ============================================================
+# Configuration
+#============================================================
+
+START = 1
+END   = 1_000_000_000_000
+
+# ============================================================
+# Deterministic Miller-Rabin for 64-bit integers
+# ============================================================
+
+def is_prime(n):
+
+    if n < 2:
+        return False
+
+    small_primes = (
+        2, 3, 5, 7, 11, 13, 17, 19,
+        23, 29, 31, 37
+    )
+
+    for p in small_primes:
+
+        if n % p == 0:
+            return n == p
+
+    d = n - 1
+    s = 0
+
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+
+    witnesses = (
+        2,
+        325,
+        9375,
+        28178,
+        450775,
+        9780504,
+        1795265022
+    )
+
+    for a in witnesses:
+
+        if a % n == 0:
+            continue
+
+        x = pow(a, d, n)
+
+        if x == 1 or x == n - 1:
+            continue
+
+        for _ in range(s - 1):
+
+            x = (x * x) % n
+
+            if x == n - 1:
+                break
+
+        else:
+            return False
+
+    return True
+
+
+# ============================================================
+# Sieve
+# ============================================================
+
+def primes_up_to(n):
+
+    if n < 2:
+        return []
+
+    sieve = bytearray(b"\x01") * (n + 1)
+
+    sieve[0:2] = b"\x00\x00"
+
+    limit = math.isqrt(n)
+
+    for p in range(2, limit + 1):
+
+        if sieve[p]:
+
+            start = p * p
+
+            sieve[start:n + 1:p] = b"\x00" * (
+                (n - start) // p + 1
+            )
+
+    return [
+        p
+        for p in range(2, n + 1)
+        if sieve[p]
+    ]
+
+
+# ============================================================
+# Safe upper bound for tau(n)
+# ============================================================
+
+def max_tau_bound(n):
+
+    bound = n * (1.0 + math.log(n))
+
+    t = int(bound ** (1.0 / 9.0))
+
+    while (t + 1) ** 9 < bound:
+        t += 1
+
+    while t ** 9 >= bound:
+        t -= 1
+
+    return t + 1
+
+
+# ============================================================
+# Generate exponent signatures
+# ============================================================
+
+def generate_signatures(max_tau, N):
+
+    signatures = []
+
+    small_primes = (
+        2, 3, 5, 7, 11, 13,
+        17, 19, 23, 29, 31, 37
+    )
+
+    def rec(last_exp, tau, exponents):
+
+        for e in range(last_exp, 0, -1):
+
+            new_tau = tau * (e + 1)
+
+            if new_tau > max_tau:
+                continue
+
+            new_exponents = exponents + (e,)
+
+            min_n = 1
+            possible = True
+
+            for i, exp in enumerate(new_exponents):
+
+                if i >= len(small_primes):
+                    possible = False
+                    break
+
+                min_n *= small_primes[i] ** exp
+
+                if min_n > N:
+                    possible = False
+                    break
+
+            if not possible:
+                continue
+
+            signatures.append(new_exponents)
+
+            rec(
+                e,
+                new_tau,
+                new_exponents
+            )
+
+    rec(max_tau, 1, ())
+
+    return signatures
+
+
+# ============================================================
+# Integer e-th root
+# ============================================================
+
+def integer_root(n, e):
+
+    if e == 1:
+        return n
+
+    r = int(n ** (1.0 / e))
+
+    while (r + 1) ** e <= n:
+        r += 1
+
+    while r ** e > n:
+        r -= 1
+
+    return r
+
+
+# ============================================================
+# Prime power arithmetic
+# ============================================================
+
+def sigma_prime_power(p, e):
+
+    return (p ** (e + 1) - 1) // (p - 1)
+
+
+def phi_prime_power(p, e):
+
+    return p ** (e - 1) * (p - 1)
+
+
+# ============================================================
+# Check whether n is NOT squarefree
+# ============================================================
+
+def is_not_squarefree(n, primes):
+
+    for p in primes:
+
+        if p * p > n:
+            break
+
+        if n % (p * p) == 0:
+            return True
+
+    return False
+
+
+# ============================================================
+# Search
+# ============================================================
+
+def search(START, END):
+
+    print()
+    print("=" * 78)
+    print("Prime-signature range search")
+    print("=" * 78)
+
+    print(f"START = {START:,}")
+    print(f"END   = {END:,}")
+
+    if START < 1:
+        raise ValueError("START must be >= 1")
+
+    if END < START:
+        raise ValueError("END must be >= START")
+
+    # --------------------------------------------------------
+    # We need primes up to sqrt(END)
+    # --------------------------------------------------------
+
+    prime_limit = math.isqrt(END)
+
+    print()
+    print(
+        f"Generating primes up to "
+        f"{prime_limit:,}..."
+    )
+
+    primes = primes_up_to(prime_limit)
+
+    print(
+        f"Primes generated: {len(primes):,}"
+    )
+
+    # --------------------------------------------------------
+    # Tau bound
+    # --------------------------------------------------------
+
+    max_tau = max_tau_bound(END)
+
+    print(
+        f"Safe tau bound: {max_tau}"
+    )
+
+    # --------------------------------------------------------
+    # Generate signatures
+    # --------------------------------------------------------
+
+    signatures = generate_signatures(
+        max_tau,
+        END
+    )
+
+    print(
+        f"Signatures: {len(signatures):,}"
+    )
+
+    print()
+
+    solutions = set()
+
+    stats = {
+        "signatures": 0,
+        "permutations": 0,
+        "prefixes": 0,
+        "final_tests": 0,
+        "pruned": 0,
+        "solutions": 0,
+    }
+
+    start_time = time.time()
+
+    # ========================================================
+    # Every possible exponent ordering
+    # ========================================================
+
+    for signature in signatures:
+
+        stats["signatures"] += 1
+
+        exponent_orders = set(
+            itertools.permutations(signature)
+        )
+
+        for exponents in exponent_orders:
+
+            stats["permutations"] += 1
+
+            r = len(exponents)
+
+            # ------------------------------------------------
+            # tau
+            # ------------------------------------------------
+
+            tau = 1
+
+            for e in exponents:
+                tau *= e + 1
+
+            target = tau ** 9
+
+            # =================================================
+            # CASE 1: n = p^e
+            # =================================================
+
+            if r == 1:
+
+                e = exponents[0]
+
+                max_p = integer_root(END, e)
+
+                for p in primes:
+
+                    if p > max_p:
+                        break
+
+                    n = p ** e
+
+                    # Range filter
+                    if n < START:
+                        continue
+
+                    if n > END:
+                        break
+
+                    stats["prefixes"] += 1
+
+                    sigma = sigma_prime_power(
+                        p,
+                        e
+                    )
+
+                    phi = phi_prime_power(
+                        p,
+                        e
+                    )
+
+                    if sigma == phi + target:
+
+                        solutions.add(n)
+
+                        stats["solutions"] += 1
+
+                continue
+
+            # =================================================
+            # Recursive search
+            # =================================================
+
+            def search_prefix(
+                depth,
+                prime_index,
+                m,
+                sigma_m,
+                phi_m,
+                last_prime
+            ):
+
+                # ------------------------------------------------
+                # Final prime
+                # ------------------------------------------------
+
+                if depth == r - 1:
+
+                    e = exponents[-1]
+
+                    # We need:
+                    #
+                    # START <= m*p^e <= END
+                    #
+                    # therefore:
+                    #
+                    # ceil_root(START/m) <= p <= root(END/m)
+
+                    min_value = (START + m - 1) // m
+
+                    max_value = END // m
+
+                    if min_value <= 0:
+                        return
+
+                    min_p = integer_root(min_value, e)
+
+                    if min_p ** e < min_value:
+                        min_p += 1
+
+                    max_p = integer_root(
+                        max_value,
+                        e
+                    )
+
+                    # Prime must be greater than previous prime
+                    idx = bisect.bisect_right(
+                        primes,
+                        last_prime
+                    )
+
+                    if idx >= len(primes):
+                        return
+
+                    first_prime = primes[idx]
+
+                    if min_p < first_prime:
+                        min_p = first_prime
+
+                    if min_p > max_p:
+                        return
+
+                    stats["final_tests"] += 1
+
+                    # ------------------------------------------------
+                    # f(p)
+                    # ------------------------------------------------
+
+                    def f(p):
+
+                        sigma_p = sigma_prime_power(
+                            p,
+                            e
+                        )
+
+                        phi_p = phi_prime_power(
+                            p,
+                            e
+                        )
+
+                        return (
+                            sigma_m * sigma_p
+                            - phi_m * phi_p
+                            - target
+                        )
+
+                    # ------------------------------------------------
+                    # Monotonicity pruning
+                    # ------------------------------------------------
+
+                    if f(min_p) > 0:
+
+                        stats["pruned"] += 1
+                        return
+
+                    if f(max_p) < 0:
+                        return
+
+                    # ------------------------------------------------
+                    # Binary search
+                    # ------------------------------------------------
+
+                    lo = min_p
+                    hi = max_p
+
+                    while lo < hi:
+
+                        mid = (lo + hi) // 2
+
+                        if f(mid) >= 0:
+                            hi = mid
+                        else:
+                            lo = mid + 1
+
+                    candidate_p = lo
+
+                    # ------------------------------------------------
+                    # Exact equality
+                    # ------------------------------------------------
+
+                    if f(candidate_p) != 0:
+                        return
+
+                    # ------------------------------------------------
+                    # Candidate must be prime
+                    # ------------------------------------------------
+
+                    if not is_prime(candidate_p):
+                        return
+
+                    n = m * candidate_p ** e
+
+                    # Final range check
+                    if START <= n <= END:
+
+                        solutions.add(n)
+
+                        stats["solutions"] += 1
+
+                    return
+
+                # =================================================
+                # Choose prefix prime
+                # =================================================
+
+                e = exponents[depth]
+
+                for idx in range(
+                    prime_index,
+                    len(primes)
+                ):
+
+                    p = primes[idx]
+
+                    p_power = p ** e
+
+                    new_m = m * p_power
+
+                    if new_m > END:
+                        break
+
+                    new_sigma = (
+                        sigma_m
+                        * sigma_prime_power(
+                            p,
+                            e
+                        )
+                    )
+
+                    new_phi = (
+                        phi_m
+                        * phi_prime_power(
+                            p,
+                            e
+                        )
+                    )
+
+                    stats["prefixes"] += 1
+
+                    # ------------------------------------------------
+                    # Minimum possible completion
+                    # ------------------------------------------------
+
+                    test_sigma = new_sigma
+                    test_phi = new_phi
+                    test_product = new_m
+
+                    next_idx = idx + 1
+
+                    possible = True
+
+                    for future_e in exponents[
+                        depth + 1:
+                    ]:
+
+                        if next_idx >= len(primes):
+
+                            possible = False
+                            break
+
+                        q = primes[next_idx]
+
+                        test_product *= q ** future_e
+
+                        if test_product > END:
+
+                            possible = False
+                            break
+
+                        test_sigma *= (
+                            sigma_prime_power(
+                                q,
+                                future_e
+                            )
+                        )
+
+                        test_phi *= (
+                            phi_prime_power(
+                                q,
+                                future_e
+                            )
+                        )
+
+                        next_idx += 1
+
+                    if not possible:
+                        break
+
+                    # ------------------------------------------------
+                    # Pruning
+                    # ------------------------------------------------
+
+                    if (
+                        test_sigma
+                        - test_phi
+                        > target
+                    ):
+
+                        stats["pruned"] += 1
+
+                        break
+
+                    search_prefix(
+                        depth + 1,
+                        idx + 1,
+                        new_m,
+                        new_sigma,
+                        new_phi,
+                        p
+                    )
+
+            # ------------------------------------------------
+            # Start recursion
+            # ------------------------------------------------
+
+            search_prefix(
+                depth=0,
+                prime_index=0,
+                m=1,
+                sigma_m=1,
+                phi_m=1,
+                last_prime=1
+            )
+
+    # ========================================================
+    # Results
+    # ========================================================
+
+    elapsed = time.time() - start_time
+
+    solutions = sorted(solutions)
+
+    print()
+    print("=" * 78)
+    print("SEARCH FINISHED")
+    print("=" * 78)
+
+    print(
+        f"Range: {START:,} ... {END:,}"
+    )
+
+    print(
+        f"Time: {elapsed:,.2f} seconds"
+    )
+
+    print(
+        f"Signatures: "
+        f"{stats['signatures']:,}"
+    )
+
+    print(
+        f"Exponent permutations: "
+        f"{stats['permutations']:,}"
+    )
+
+    print(
+        f"Prefix candidates: "
+        f"{stats['prefixes']:,}"
+    )
+
+    print(
+        f"Final candidates: "
+        f"{stats['final_tests']:,}"
+    )
+
+    print(
+        f"Pruned branches: "
+        f"{stats['pruned']:,}"
+    )
+
+    print(
+        f"All solutions in range: "
+        f"{len(solutions):,}"
+    )
+
+    # ========================================================
+    # Filter non-squarefree solutions
+    # ========================================================
+
+    non_squarefree = [
+        n
+        for n in solutions
+        if is_not_squarefree(n, primes)
+    ]
+
+    print(
+        f"Non-squarefree solutions: "
+        f"{len(non_squarefree):,}"
+    )
+
+    print()
+
+    if non_squarefree:
+
+        print("Non-squarefree solutions:")
+        print("-" * 78)
+
+        for n in non_squarefree:
+
+            print(f"{n:,}")
+
+    else:
+
+        print(
+            "No non-squarefree solutions found."
+        )
+
+    return non_squarefree
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+
+    search(START, END)
